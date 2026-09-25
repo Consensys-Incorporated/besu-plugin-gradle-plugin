@@ -23,8 +23,7 @@ import org.gradle.api.artifacts.Configuration;
 import org.gradle.api.distribution.DistributionContainer;
 import org.gradle.api.distribution.plugins.DistributionPlugin;
 import org.gradle.api.file.CopySpec;
-import org.gradle.api.plugins.internal.JavaPluginHelper;
-import org.gradle.api.plugins.jvm.internal.JvmFeatureInternal;
+import org.gradle.api.plugins.JavaPlugin;
 import org.gradle.api.tasks.TaskProvider;
 import org.gradle.jvm.tasks.Jar;
 
@@ -77,26 +76,22 @@ public abstract class BesuPluginDistribution implements Plugin<Project> {
                               .getBuildDirectory()
                               .dir(PLUGIN_ONLY_ARTIFACTS_RELATIVE_PATH));
                 });
+    TaskProvider<Jar> jar = project.getTasks().named(JavaPlugin.JAR_TASK_NAME, Jar.class);
+    jar.configure(
+        task ->
+            task.from(
+                collectPluginOnlyRuntimeArtifacts.flatMap(
+                    CollectPluginOnlyRuntimeArtifactsTask::getArtifactsCatalogFile),
+                copySpec -> copySpec.into("META-INF/")));
+
     project
-        .getTasks()
-        .withType(Jar.class)
-        .configureEach(
-            jar ->
-                jar.from(
-                    collectPluginOnlyRuntimeArtifacts.flatMap(
-                        CollectPluginOnlyRuntimeArtifactsTask::getArtifactsCatalogFile),
-                    copySpec -> copySpec.into("META-INF/")));
-
-    JvmFeatureInternal mainFeature = JavaPluginHelper.getJavaComponent(project).getMainFeature();
-
-    DistributionContainer distributionContainer =
-        (DistributionContainer) project.getExtensions().getByName("distributions");
-    distributionContainer
+        .getExtensions()
+        .getByType(DistributionContainer.class)
         .named(DistributionPlugin.MAIN_DISTRIBUTION_NAME)
         .configure(
             dist -> {
               CopySpec childSpec = project.copySpec();
-              childSpec.from(mainFeature.getJarTask());
+              childSpec.from(jar);
               childSpec.from(project.file("src/dist"));
               childSpec.from(
                   collectPluginOnlyRuntimeArtifacts.flatMap(

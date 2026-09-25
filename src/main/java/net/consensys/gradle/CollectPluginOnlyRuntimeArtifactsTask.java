@@ -101,7 +101,7 @@ public abstract class CollectPluginOnlyRuntimeArtifactsTask extends DefaultTask 
 
     // Preserve the resolution order, so the output is stable across builds
     Map<File, ModuleVersionIdentifier> pluginOnlyRuntimeArtifacts = new LinkedHashMap<>();
-    getLogger().lifecycle("Collecting pluginOnlyRuntimeArtifacts");
+    getLogger().info("Collecting pluginOnlyRuntimeArtifacts");
     for (ResolvedArtifactResult artifact : getResolvedArtifacts().get()) {
       ModuleVersionIdentifier moduleVersion =
           moduleVersions.get(artifact.getId().getComponentIdentifier());
@@ -109,10 +109,10 @@ public abstract class CollectPluginOnlyRuntimeArtifactsTask extends DefaultTask 
         throw new IllegalStateException(
             "Unable to find the module version of the runtime artifact " + artifact.getId());
       }
-      getLogger().lifecycle("Processing {}", moduleVersion);
+      getLogger().debug("Processing {}", moduleVersion);
       if (!providedByBesu(besuProvidedDependencies, moduleVersion)) {
         getLogger()
-            .lifecycle(
+            .info(
                 "Plugin only runtime dependency {}, artifact {}",
                 moduleVersion,
                 artifact.getFile());
@@ -121,7 +121,7 @@ public abstract class CollectPluginOnlyRuntimeArtifactsTask extends DefaultTask 
     }
 
     getLogger()
-        .lifecycle("Collected pluginOnlyRuntimeClasspath artifacts {}", pluginOnlyRuntimeArtifacts);
+        .info("Collected pluginOnlyRuntimeClasspath artifacts {}", pluginOnlyRuntimeArtifacts);
 
     copyPluginOnlyRuntimeArtifacts(pluginOnlyRuntimeArtifacts.keySet());
     generateArtifactsCatalog(pluginOnlyRuntimeArtifacts);
@@ -159,13 +159,13 @@ public abstract class CollectPluginOnlyRuntimeArtifactsTask extends DefaultTask 
     String coordinate = moduleVersion.getGroup() + ":" + moduleVersion.getName();
 
     if (BesuOld2NewCoordinatesMapping.getOld2NewCoordinates().containsKey(coordinate)) {
-      getLogger().lifecycle("Excluding old Besu dependency {}", moduleVersion);
+      getLogger().info("Excluding old Besu dependency {}", moduleVersion);
       return true;
     }
 
     if (besuProvidedDependencies.contains(coordinate)) {
       getLogger()
-          .lifecycle(
+          .info(
               "Excluding runtime dependency {} since it is already provided by Besu",
               moduleVersion);
       return true;
@@ -211,7 +211,7 @@ public abstract class CollectPluginOnlyRuntimeArtifactsTask extends DefaultTask 
     doc.put("dependencies", jsonDependencies);
 
     String json = new JsonBuilder(doc).toPrettyString();
-    getLogger().lifecycle("Generated artifacts catalog {}", json);
+    getLogger().info("Generated artifacts catalog {}", json);
     File catalogFile = getArtifactsCatalogFile().get().getAsFile();
     try {
       Files.writeString(catalogFile.toPath(), json, StandardCharsets.UTF_8);
