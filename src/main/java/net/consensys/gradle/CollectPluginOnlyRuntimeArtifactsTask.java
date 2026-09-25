@@ -18,167 +18,201 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import javax.inject.Inject;
 
 import groovy.json.JsonBuilder;
-import net.consensys.gradle.BesuPluginLibrary.BesuProvidedDependency;
 import org.gradle.api.DefaultTask;
-import org.gradle.api.artifacts.Configuration;
-import org.gradle.api.artifacts.ResolvedDependency;
+import org.gradle.api.artifacts.ModuleVersionIdentifier;
+import org.gradle.api.artifacts.component.ComponentIdentifier;
+import org.gradle.api.artifacts.result.DependencyResult;
+import org.gradle.api.artifacts.result.ResolvedArtifactResult;
+import org.gradle.api.artifacts.result.ResolvedComponentResult;
+import org.gradle.api.artifacts.result.ResolvedDependencyResult;
 import org.gradle.api.file.ConfigurableFileCollection;
+import org.gradle.api.file.DirectoryProperty;
+import org.gradle.api.file.FileSystemOperations;
+import org.gradle.api.file.RegularFileProperty;
+import org.gradle.api.provider.Property;
+import org.gradle.api.provider.SetProperty;
 import org.gradle.api.tasks.Classpath;
+import org.gradle.api.tasks.Input;
+import org.gradle.api.tasks.InputFile;
+import org.gradle.api.tasks.Internal;
+import org.gradle.api.tasks.OutputDirectory;
+import org.gradle.api.tasks.OutputFile;
+import org.gradle.api.tasks.PathSensitive;
+import org.gradle.api.tasks.PathSensitivity;
 import org.gradle.api.tasks.TaskAction;
+import org.gradle.work.DisableCachingByDefault;
 
+/**
+ * Collects the runtime artifacts of the plugin that are not already provided by Besu. They are
+ * copied into {@link #getPluginOnlyArtifactsDirectory()}, to be included in the plugin
+ * distribution, and described in the plugin artifacts catalog {@link #getArtifactsCatalogFile()}.
+ */
+@DisableCachingByDefault(because = "Copies runtime artifacts, not worth caching")
 public abstract class CollectPluginOnlyRuntimeArtifactsTask extends DefaultTask {
   static final String TASK_NAME = "collectPluginOnlyRuntimeArtifacts";
-  static final String BESU_PLUGIN_ONLY_RUNTIME_ARTIFACTS =
-      CollectPluginOnlyRuntimeArtifactsTask.class.getName() + ".pluginOnlyRuntimeArtifacts";
   static final String PLUGIN_ARTIFACTS_CATALOG_RELATIVE_PATH =
       "reports/dependencies/plugin-artifacts-catalog.json";
+  static final String PLUGIN_ONLY_ARTIFACTS_RELATIVE_PATH = "besu-plugin/plugin-only-artifacts";
 
+  /** The files of the runtime classpath, used to track changes of the resolved artifacts. */
   @Classpath
   public abstract ConfigurableFileCollection getRuntimeArtifacts();
 
+  /** The resolved artifacts of the runtime classpath. */
+  @Internal
+  public abstract SetProperty<ResolvedArtifactResult> getResolvedArtifacts();
+
+  /** The root of the resolved dependency graph of the runtime classpath. */
+  @Internal
+  public abstract Property<ResolvedComponentResult> getRootComponent();
+
+  /** The coordinates of the dependencies provided by Besu, one {@code group:name} per line. */
+  @InputFile
+  @PathSensitive(PathSensitivity.NONE)
+  public abstract RegularFileProperty getBesuProvidedDependenciesFile();
+
+  @Input
+  public abstract Property<String> getBesuVersion();
+
+  @OutputFile
+  public abstract RegularFileProperty getArtifactsCatalogFile();
+
+  @OutputDirectory
+  public abstract DirectoryProperty getPluginOnlyArtifactsDirectory();
+
+  @Inject
+  protected abstract FileSystemOperations getFileSystemOperations();
+
   @TaskAction
   public void collectRuntimeArtifacts() {
-    Configuration runtimeClasspath = getProject().getConfigurations().getByName("runtimeClasspath");
-    List<BesuProvidedDependency> besuProvidedDependencies =
-        (List<BesuProvidedDependency>)
-            getProject()
-                .getExtensions()
-                .getExtraProperties()
-                .get(BesuPluginLibrary.BESU_PROVIDED_DEPENDENCIES);
+    Set<String> besuProvidedDependencies = readBesuProvidedDependencies();
+    Map<ComponentIdentifier, ModuleVersionIdentifier> moduleVersions = collectModuleVersions();
 
-    Set<ResolvedDependency> alreadyEvaluated = new HashSet<>();
-    Map<File, ResolvedDependency> pluginOnlyRuntimeArtifacts = new HashMap<>();
+    // Preserve the resolution order, so the output is stable across builds
+    Map<File, ModuleVersionIdentifier> pluginOnlyRuntimeArtifacts = new LinkedHashMap<>();
     getLogger().lifecycle("Collecting pluginOnlyRuntimeArtifacts");
-    Set<ResolvedDependency> firstLevelDeps =
-        runtimeClasspath.getResolvedConfiguration().getFirstLevelModuleDependencies();
-
-    // Process first-level dependencies
-    for (ResolvedDependency dependency : firstLevelDeps) {
-      alreadyEvaluated.add(dependency);
-      getLogger().lifecycle("Processing {}", dependency.getChildren());
-      if (!providedByBesu(besuProvidedDependencies, dependency)) {
+    for (ResolvedArtifactResult artifact : getResolvedArtifacts().get()) {
+      ModuleVersionIdentifier moduleVersion =
+          moduleVersions.get(artifact.getId().getComponentIdentifier());
+      if (moduleVersion == null) {
+        throw new IllegalStateException(
+            "Unable to find the module version of the runtime artifact " + artifact.getId());
+      }
+      getLogger().lifecycle("Processing {}", moduleVersion);
+      if (!providedByBesu(besuProvidedDependencies, moduleVersion)) {
         getLogger()
             .lifecycle(
-                "Plugin only runtime dependency {}, artifacts {}",
-                dependency,
-                dependency.getModuleArtifacts());
-        dependency
-            .getModuleArtifacts()
-            .forEach(artifact -> pluginOnlyRuntimeArtifacts.put(artifact.getFile(), dependency));
+                "Plugin only runtime dependency {}, artifact {}",
+                moduleVersion,
+                artifact.getFile());
+        pluginOnlyRuntimeArtifacts.put(artifact.getFile(), moduleVersion);
       }
-
-      processTransitiveDependencies(
-          besuProvidedDependencies, dependency, pluginOnlyRuntimeArtifacts, alreadyEvaluated);
     }
 
     getLogger()
         .lifecycle("Collected pluginOnlyRuntimeClasspath artifacts {}", pluginOnlyRuntimeArtifacts);
 
+    copyPluginOnlyRuntimeArtifacts(pluginOnlyRuntimeArtifacts.keySet());
     generateArtifactsCatalog(pluginOnlyRuntimeArtifacts);
-
-    getProject()
-        .getExtensions()
-        .getExtraProperties()
-        .set(BESU_PLUGIN_ONLY_RUNTIME_ARTIFACTS, Map.copyOf(pluginOnlyRuntimeArtifacts));
   }
 
-  private void processTransitiveDependencies(
-      List<BesuProvidedDependency> besuProvidedDependencies,
-      ResolvedDependency dependency,
-      Map<File, ResolvedDependency> pluginOnlyRuntimeArtifacts,
-      Set<ResolvedDependency> alreadyEvaluated) {
-    for (ResolvedDependency child : dependency.getChildren()) {
-      if (!alreadyEvaluated.contains(child)) {
-        getLogger().lifecycle("Processing {}", child);
-        alreadyEvaluated.add(child);
-        if (!providedByBesu(besuProvidedDependencies, child)) {
-          getLogger()
-              .lifecycle(
-                  "Plugin only runtime dependency {}, artifacts {}",
-                  child,
-                  child.getModuleArtifacts());
-          child
-              .getModuleArtifacts()
-              .forEach(artifact -> pluginOnlyRuntimeArtifacts.put(artifact.getFile(), child));
+  private Set<String> readBesuProvidedDependencies() {
+    File besuProvidedDependenciesFile = getBesuProvidedDependenciesFile().get().getAsFile();
+    try {
+      return new HashSet<>(
+          Files.readAllLines(besuProvidedDependenciesFile.toPath(), StandardCharsets.UTF_8));
+    } catch (IOException e) {
+      throw new RuntimeException(
+          "Unable to read Besu provided dependencies from file " + besuProvidedDependenciesFile, e);
+    }
+  }
+
+  private Map<ComponentIdentifier, ModuleVersionIdentifier> collectModuleVersions() {
+    Map<ComponentIdentifier, ModuleVersionIdentifier> moduleVersions = new HashMap<>();
+    List<ResolvedComponentResult> toVisit = new ArrayList<>(List.of(getRootComponent().get()));
+    while (!toVisit.isEmpty()) {
+      ResolvedComponentResult component = toVisit.removeLast();
+      if (moduleVersions.putIfAbsent(component.getId(), component.getModuleVersion()) == null) {
+        for (DependencyResult dependency : component.getDependencies()) {
+          if (dependency instanceof ResolvedDependencyResult resolvedDependency) {
+            toVisit.add(resolvedDependency.getSelected());
+          }
         }
-        // Recursively process children
-        processTransitiveDependencies(
-            besuProvidedDependencies, child, pluginOnlyRuntimeArtifacts, alreadyEvaluated);
       }
     }
+    return moduleVersions;
   }
 
   private boolean providedByBesu(
-      List<BesuProvidedDependency> besuProvidedDependencies, ResolvedDependency dependency) {
-    String coordinate = dependency.getModuleGroup() + ":" + dependency.getModuleName();
+      Set<String> besuProvidedDependencies, ModuleVersionIdentifier moduleVersion) {
+    String coordinate = moduleVersion.getGroup() + ":" + moduleVersion.getName();
 
     if (BesuOld2NewCoordinatesMapping.getOld2NewCoordinates().containsKey(coordinate)) {
-      getLogger().lifecycle("Excluding old Besu dependency {}", dependency);
+      getLogger().lifecycle("Excluding old Besu dependency {}", moduleVersion);
       return true;
     }
 
-    var maybeBesuProvided =
-        besuProvidedDependencies.stream()
-            .filter(
-                providedDependency ->
-                    coordinate.equals(
-                        providedDependency.dependency().getGroup()
-                            + ":"
-                            + providedDependency.dependency().getName()))
-            .findAny();
-
-    if (maybeBesuProvided.isPresent()) {
+    if (besuProvidedDependencies.contains(coordinate)) {
       getLogger()
           .lifecycle(
-              "Excluding runtime dependency with coordinates {}({}) is already provided by Besu: '{}'",
-              dependency,
-              coordinate,
-              maybeBesuProvided.get());
+              "Excluding runtime dependency {} since it is already provided by Besu",
+              moduleVersion);
       return true;
     }
 
     return false;
   }
 
+  private void copyPluginOnlyRuntimeArtifacts(final Set<File> pluginOnlyRuntimeArtifacts) {
+    File outputDirectory = getPluginOnlyArtifactsDirectory().get().getAsFile();
+    getFileSystemOperations().delete(spec -> spec.delete(outputDirectory));
+    outputDirectory.mkdirs();
+    for (File artifact : pluginOnlyRuntimeArtifacts) {
+      try {
+        Files.copy(
+            artifact.toPath(),
+            outputDirectory.toPath().resolve(artifact.getName()),
+            StandardCopyOption.REPLACE_EXISTING);
+      } catch (IOException e) {
+        throw new RuntimeException(
+            "Unable to copy plugin runtime artifact " + artifact + " to " + outputDirectory, e);
+      }
+    }
+  }
+
   private void generateArtifactsCatalog(
-      final Map<File, ResolvedDependency> pluginOnlyRuntimeArtifacts) {
+      final Map<File, ModuleVersionIdentifier> pluginOnlyRuntimeArtifacts) {
     List<Map<String, String>> jsonDependencies =
         pluginOnlyRuntimeArtifacts.entrySet().stream()
             .map(
-                e ->
-                    Map.of(
-                        "group", e.getValue().getModuleGroup(),
-                        "name", e.getValue().getModuleName(),
-                        "version", e.getValue().getModuleVersion(),
-                        "filename", e.getKey().getName()))
+                e -> {
+                  Map<String, String> dependency = new LinkedHashMap<>();
+                  dependency.put("group", e.getValue().getGroup());
+                  dependency.put("name", e.getValue().getName());
+                  dependency.put("version", e.getValue().getVersion());
+                  dependency.put("filename", e.getKey().getName());
+                  return dependency;
+                })
             .toList();
 
-    Map<String, Object> doc =
-        Map.of(
-            "besuVersion",
-            getProject().property("besuVersion").toString(),
-            "dependencies",
-            jsonDependencies);
+    Map<String, Object> doc = new LinkedHashMap<>();
+    doc.put("besuVersion", getBesuVersion().get());
+    doc.put("dependencies", jsonDependencies);
 
-    JsonBuilder jsonBuilder = new JsonBuilder(doc);
-
-    String json = jsonBuilder.toPrettyString();
+    String json = new JsonBuilder(doc).toPrettyString();
     getLogger().lifecycle("Generated artifacts catalog {}", json);
-    var catalogFile =
-        getProject()
-            .getLayout()
-            .getBuildDirectory()
-            .file(PLUGIN_ARTIFACTS_CATALOG_RELATIVE_PATH)
-            .get()
-            .getAsFile();
-    catalogFile.getParentFile().mkdirs();
+    File catalogFile = getArtifactsCatalogFile().get().getAsFile();
     try {
       Files.writeString(catalogFile.toPath(), json, StandardCharsets.UTF_8);
     } catch (IOException e) {

@@ -18,7 +18,6 @@ import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
 import java.net.URI;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.FileSystem;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
@@ -43,18 +42,16 @@ import org.gradle.api.artifacts.component.ModuleComponentIdentifier;
 import org.gradle.api.artifacts.component.ModuleComponentSelector;
 import org.gradle.api.plugins.JavaLibraryPlugin;
 import org.gradle.api.provider.Provider;
-import org.gradle.api.tasks.compile.AbstractCompile;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 import org.xml.sax.SAXException;
 
 public abstract class BesuPluginLibrary implements Plugin<Project> {
-  static final String BESU_PROVIDED_DEPENDENCIES =
-      BesuPluginLibrary.class.getName() + ".besuBomDependencies";
   static final String RESOLVE_BESU_DEPS_TASK_NAME = "resolveBesuProvidedDependencies";
-  static final String RESOLVE_BESU_DEPS_MARKER_RELATIVE_PATH =
-      "reports/dependencies/besu-resolved-deps.marker";
+  static final String BESU_PROVIDED_DEPENDENCIES_RELATIVE_PATH =
+      "reports/dependencies/besu-provided-dependencies.txt";
+  static final String BESU_MAIN_JAR_CONFIGURATION_NAME = "besuMainJar";
   static final String BESU_BOM_DEPENDENCY_COORDINATES = "org.hyperledger.besu:bom";
   static final String BESU_MAIN_DEPENDENCY_COORDINATES = "org.hyperledger.besu.internal:besu-app";
   static final String BESU_ARTIFACTS_CATALOG_RESOURCE_NAME =
@@ -72,11 +69,49 @@ public abstract class BesuPluginLibrary implements Plugin<Project> {
 
     // Set default value for besuRepo
     extension.getBesuRepo().convention("https://hyperledger.jfrog.io/hyperledger/besu-maven/");
-    Provider<String> besuVersionProvider =
-        extension.getBesuVersion().orElse(project.getProviders().gradleProperty("besuVersion"));
+    extension.getBesuVersion().convention(project.getProviders().gradleProperty("besuVersion"));
+    Provider<String> besuVersionProvider = extension.getBesuVersion();
 
-    // Register eagerly so consumers can depend on this task during configuration.
-    project.getTasks().register(RESOLVE_BESU_DEPS_TASK_NAME);
+    // The Besu main jar embeds the Besu artifacts catalog
+    Configuration besuMainJarConfiguration =
+        project
+            .getConfigurations()
+            .create(
+                BESU_MAIN_JAR_CONFIGURATION_NAME,
+                cfg -> {
+                  cfg.setCanBeConsumed(false);
+                  cfg.setCanBeResolved(true);
+                  cfg.getDependencies()
+                      .addLater(
+                          besuVersionProvider.map(
+                              besuVersion ->
+                                  project
+                                      .getDependencies()
+                                      .create(
+                                          BESU_MAIN_DEPENDENCY_COORDINATES
+                                              + ":"
+                                              + besuVersion
+                                              + "@jar")));
+                });
+
+    project
+        .getTasks()
+        .register(
+            RESOLVE_BESU_DEPS_TASK_NAME,
+            ResolveBesuProvidedDependenciesTask.class,
+            task -> {
+              task.setGroup("Build");
+              task.setDescription(
+                  "Resolves the coordinates of the dependencies provided by Besu, from the Besu artifacts catalog.");
+              task.getBesuVersion().set(besuVersionProvider);
+              task.getBesuMainJar().from(besuMainJarConfiguration);
+              task.getBesuProvidedDependenciesFile()
+                  .set(
+                      project
+                          .getLayout()
+                          .getBuildDirectory()
+                          .file(BESU_PROVIDED_DEPENDENCIES_RELATIVE_PATH));
+            });
 
     // Configure after project evaluation to allow extension configuration.
     // Only repositories and resolution strategies are set here — none of these
@@ -133,63 +168,11 @@ public abstract class BesuPluginLibrary implements Plugin<Project> {
                           dep.getGroup() + ":" + dep.getName(), managedVersion);
                     }
                   }
-                  project
-                      .getExtensions()
-                      .getExtraProperties()
-                      .set(BESU_PROVIDED_DEPENDENCIES, List.copyOf(catalogDeps));
-                  project.getExtensions().getExtraProperties().set("besuVersion", besuVersion);
                   mergedDepsRef.set(List.copyOf(mergedDeps));
                   managedVersionsByCoordinatesRef.set(Map.copyOf(managedVersionsByCoordinates));
                   initialized.set(true);
                 }
               };
-
-          project
-              .getTasks()
-              .named(RESOLVE_BESU_DEPS_TASK_NAME)
-              .configure(
-                  task -> {
-                    task.setGroup("Build");
-                    task.setDescription(
-                        "Resolves Besu BOM and catalog dependencies for Besu plugin builds.");
-                    task.getInputs().property("besuVersion", besuVersionProvider);
-                    task.getOutputs()
-                        .file(
-                            project
-                                .getLayout()
-                                .getBuildDirectory()
-                                .file(RESOLVE_BESU_DEPS_MARKER_RELATIVE_PATH));
-                    task.doLast(
-                        t -> {
-                          ensureResolved.run();
-                          var markerFile =
-                              project
-                                  .getLayout()
-                                  .getBuildDirectory()
-                                  .file(RESOLVE_BESU_DEPS_MARKER_RELATIVE_PATH)
-                                  .get()
-                                  .getAsFile();
-                          markerFile.getParentFile().mkdirs();
-                          try {
-                            Files.writeString(
-                                markerFile.toPath(),
-                                "besuVersion="
-                                    + requireBesuVersion(besuVersionProvider)
-                                    + System.lineSeparator(),
-                                StandardCharsets.UTF_8);
-                          } catch (IOException e) {
-                            throw new RuntimeException(
-                                "Unable to write Besu dependency resolution marker file "
-                                    + markerFile,
-                                e);
-                          }
-                        });
-                  });
-
-          project
-              .getTasks()
-              .withType(AbstractCompile.class)
-              .configureEach(task -> task.dependsOn(RESOLVE_BESU_DEPS_TASK_NAME));
 
           for (String configName :
               List.of("compileOnly", "testImplementation", "testCompileOnly")) {
@@ -312,17 +295,19 @@ public abstract class BesuPluginLibrary implements Plugin<Project> {
                     .create(BESU_MAIN_DEPENDENCY_COORDINATES + ":" + besuVersion + "@jar"));
     besuDependencyCatalogConfiguration.setCanBeResolved(true);
     File besuMainJar = besuDependencyCatalogConfiguration.getSingleFile();
-    String besuDependencyCatalog;
-    try (FileSystem zipFs = FileSystems.newFileSystem(besuMainJar.toPath())) {
-      besuDependencyCatalog = Files.readString(zipFs.getPath(BESU_ARTIFACTS_CATALOG_RESOURCE_NAME));
-    } catch (IOException e) {
-      throw new RuntimeException(e);
-    }
+    return parseBesuDependencyCatalog(project, readBesuArtifactsCatalog(besuMainJar));
+  }
 
-    try {
-      return parseBesuDependencyCatalog(project, besuDependencyCatalog);
-    } catch (ParserConfigurationException | IOException | SAXException e) {
-      throw new RuntimeException(e);
+  /** Reads the entries of the Besu artifacts catalog embedded in the Besu main jar. */
+  @SuppressWarnings("unchecked")
+  static List<Map<String, String>> readBesuArtifactsCatalog(final File besuMainJar) {
+    try (FileSystem zipFs = FileSystems.newFileSystem(besuMainJar.toPath())) {
+      String besuDependencyCatalog =
+          Files.readString(zipFs.getPath(BESU_ARTIFACTS_CATALOG_RESOURCE_NAME));
+      return (List<Map<String, String>>) new JsonSlurper().parseText(besuDependencyCatalog);
+    } catch (IOException e) {
+      throw new RuntimeException(
+          "Unable to read the Besu artifacts catalog from " + besuMainJar, e);
     }
   }
 
@@ -393,13 +378,10 @@ public abstract class BesuPluginLibrary implements Plugin<Project> {
   }
 
   private List<BesuProvidedDependency> parseBesuDependencyCatalog(
-      final Project project, final String besuDependencyCatalog)
-      throws ParserConfigurationException, IOException, SAXException {
+      final Project project, final List<Map<String, String>> besuDependencyCatalog) {
     List<BesuProvidedDependency> besuProvidedDependencies = new ArrayList<>();
 
-    ArrayList json = (ArrayList) new JsonSlurper().parseText(besuDependencyCatalog);
-    for (Object o : json) {
-      Map<String, String> dependency = (Map<String, String>) o;
+    for (Map<String, String> dependency : besuDependencyCatalog) {
       besuProvidedDependencies.add(
           new BesuProvidedDependency(
               project
