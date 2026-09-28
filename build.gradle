@@ -80,7 +80,7 @@ configure(allprojects) {
       // This path needs to be relative to each project
       target 'src/**/*.java'
       removeUnusedImports()
-      googleJavaFormat('1.25.2')
+      googleJavaFormat('1.36.1')
       importOrder 'org.hyperledger', 'java', ''
       trimTrailingWhitespace()
       endWithNewline()
