@@ -13,11 +13,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 plugins {
-  id 'net.consensys.besu-plugin-distribution' version '0.2.1'
+  id 'net.consensys.besu-plugin-distribution' version '0.3.0'
 }
 
 besuPlugin {
-  besuVersion = '26.2.0'
+  besuVersion = '26.9.0'
 }
 
 dependencies {
