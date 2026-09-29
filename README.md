@@ -72,7 +72,7 @@ What is still missing are the checks to notify the devs about possible errors th
 Set the version of Besu to use in `build.gradle` using the `besuPlugin` extension:
 ```groovy
 besuPlugin {
-    besuVersion = '26.2.0'
+    besuVersion = '26.9.0'
 }
 ```
 
@@ -80,7 +80,7 @@ Then in the `build.gradle` of define that you want to use the plugin
 
 ```groovy
 plugins {
-    id 'net.consensys.besu-plugin-distribution' version '0.2.1'
+    id 'net.consensys.besu-plugin-distribution' version '0.3.0'
 }
 ```
 
@@ -97,7 +97,7 @@ Then since the libraries are not meant to be distributed as plugins, you need to
 
 ```groovy
 plugins {
-    id 'net.consensys.besu-plugin-library' version '0.2.1'
+    id 'net.consensys.besu-plugin-library' version '0.3.0'
 }
 ```
 
