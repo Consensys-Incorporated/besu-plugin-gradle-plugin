@@ -21,6 +21,16 @@ public abstract class BesuPluginLibraryExtension {
   /** The version of Besu to use for plugin development. */
   public abstract Property<String> getBesuVersion();
 
-  /** The Maven repository URL where Besu artifacts are located. */
+  /**
+   * The Maven repository URL where Besu artifacts are located, defaults to the {@code besuRepo}
+   * project property, or the Hyperledger Besu repository.
+   */
   public abstract Property<String> getBesuRepo();
+
+  /**
+   * Whether the plugin adds the repositories needed to fetch the Besu dependencies, defaults to
+   * {@code true}. Disable it when repositories are declared in the settings, for example with
+   * {@code RepositoriesMode.FAIL_ON_PROJECT_REPOS}.
+   */
+  public abstract Property<Boolean> getConfigureRepositories();
 }
